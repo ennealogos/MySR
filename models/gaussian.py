@@ -5,10 +5,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections import namedtuple
 
 import models
 from models import register
 from utils import to_pixel_samples
+
 
 
 def default_conv(in_channels, out_channels, kernel_size, bias=True):
@@ -120,6 +122,11 @@ def extract_patch(image, center, radius, padding_mode='constant'):
     return patch
 
 
+class GaussianInjectionBlock(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super(GaussianInjectionBlock, self).__init__()
+
+
 @register('gaussian-splatter')
 class GaussianSplatter(nn.Module):
     """A module that applies 2D Gaussian splatting to input features."""
@@ -158,6 +165,108 @@ class GaussianSplatter(nn.Module):
         self.sigma_y = nn.Parameter(self.sigma_y)  # Standard deviation in y-axis
         self.opacity = nn.Parameter(self.opacity)  # Transparency of feature, shape=[num_points, 1]
         self.rho = nn.Parameter(self.rho)
+
+    def create_texture_gaussian_embedding(self, image_tensor_shape, density=4.0):
+        """
+        Create a texture Gaussian embedding for the input image tensor.
+        Args:
+            image_tensor_shape (tuple): Shape of input tensor [batch, channel, height, width].
+            density (float): Control the density of the Gaussian grid points. Default: 4.0.
+        Returns:
+            gaussian_embedding (torch.Tensor): Tensor of shape [batch, 7, H*W*density] containing:
+                - mu: normalized coordinates [-1, 1] for each point
+                - sigma_x: x-axis standard deviation
+                - sigma_y: y-axis standard deviation 
+                - rho: correlation coefficient
+                - mu_offset: offset for coordinates
+        """
+        # Generate a meshgrid of coordinates 
+        batch_size, _, height, width = image_tensor_shape
+        fine_height = int(height * density)
+        fine_width = int(width * density)
+
+        # 生成归一化的网格坐标
+        y_coords = torch.linspace(-1, 1, fine_height)
+        x_coords = torch.linspace(-1, 1, fine_width)
+        yy, xx = torch.meshgrid(y_coords, x_coords)
+        kernel_mesh_normalized = torch.stack([xx.flatten(), yy.flatten()], dim=1) # [H*W*density, 2]
+        
+        # 初始化高斯参数
+        mu = kernel_mesh_normalized.unsqueeze(0).expand(batch_size, -1, -1)  # [B, H*W*density, 2]
+        sigma_x = torch.randn_like(mu[..., 0]).clamp(0.2, 3.0).unsqueeze(-1)  # [B, H*W*density, 1]
+        sigma_y = torch.randn_like(mu[..., 0]).clamp(0.2, 3.0).unsqueeze(-1)  # [B, H*W*density, 1]
+        rho = (torch.rand_like(mu[..., 0]) * 2 - 1).clamp(-1, 1).unsqueeze(-1)  # [B, H*W*density, 1]
+        mu_offset = torch.ones_like(mu)  # [B, H*W*density, 2]
+
+        # 组装高斯参数
+        self.texture_gaussian_embedding = torch.cat([
+            mu,
+            sigma_x,
+            sigma_y,
+            rho,
+            mu_offset
+        ], dim=-1).permute(0, 2, 1)  # [B, 7, H*W*density]
+
+        return self.texture_gaussian_embedding
+
+
+    def create_color_gaussian_embedding(self, image_tensor, density=4.0):
+        """
+        Create a color Gaussian embedding for the input image tensor.
+        Args:
+            image_tensor (torch.Tensor): Input image tensor of shape [batch, channel, height, width].
+            density (float): Control the density of the Gaussian kernel. Default: 4.0.
+        Returns:
+            color_gaussian_embedding: a tensor with shape :[B, 10, H*W*density], which containing:
+                - mu_rgb: RGB mean values [B, 3, H*W*density]
+                - sigma_rgb: RGB standard deviations [B, 3, H*W*density]
+                - rho_rgb: RGB correlation coefficients [B, 3, H*W*density]
+                - opacity: Transparency values [B, 1, H*W*density]
+        """
+        # Generate meshgrid coordinates
+        batch_size, _, height, width = image_tensor.shape
+        fine_height = int(height * density)
+        fine_width = int(width * density)
+        
+        # 生成归一化的网格坐标
+        y_coords = torch.linspace(-1, 1, fine_height)
+        x_coords = torch.linspace(-1, 1, fine_width)
+        yy, xx = torch.meshgrid(y_coords, x_coords)
+        kernel_mesh_normalized = torch.stack([xx.flatten(), yy.flatten()], dim=1) # [H*W*density, 2]
+        
+        # 对原始图像进行采样获取RGB值作为均值
+        coords = kernel_mesh_normalized.unsqueeze(0).expand(batch_size, -1, -1)  # [B, H*W*density, 2]
+        coords_sample = coords.flip(-1).unsqueeze(1)  # [B, 1, H*W*density, 2]
+        mu_rgb = F.grid_sample(
+            image_tensor, 
+            coords_sample,
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(2).permute(0, 2, 1)  # [B, H*W*density, 3]
+        
+        # 初始化RGB通道的标准差 (使用正态分布,并确保为正)
+        sigma_rgb = torch.abs(torch.randn_like(mu_rgb)).clamp(0.1, 1.0)  # [B, H*W*density, 3]
+        
+        # 初始化RGB通道间的相关系数矩阵 (对称矩阵,对角线为1)
+        # 我们需要3个相关系数: rho_rg, rho_rb, rho_gb
+        rho_rgb = torch.zeros(batch_size, kernel_mesh_normalized.shape[0], 3, device=coords.device)  # [B, H*W*density, 3]
+        rho_rgb[..., 0] = (torch.rand_like(rho_rgb[..., 0]) * 2 - 1).clamp(-1, 1)  # rho_rg
+        rho_rgb[..., 1] = (torch.rand_like(rho_rgb[..., 1]) * 2 - 1).clamp(-1, 1)  # rho_rb
+        rho_rgb[..., 2] = (torch.rand_like(rho_rgb[..., 2]) * 2 - 1).clamp(-1, 1)  # rho_gb
+        
+        # 初始化不透明度
+        opacity = torch.ones(batch_size, kernel_mesh_normalized.shape[0], 1, device=coords.device)  # [B, H*W*density, 1]
+        
+        # 组装所有参数
+        self.color_gaussian_embedding = torch.cat([
+            mu_rgb,          # RGB均值 [B, H*W*density, 3]
+            sigma_rgb,       # RGB标准差 [B, H*W*density, 3]
+            rho_rgb,         # RGB相关系数 [B, H*W*density, 3]
+            opacity,         # 不透明度 [B, H*W*density, 1]
+        ], dim=-1).permute(0, 2, 1)  # [B, 10, H*W*density]
+        
+        return self.color_gaussian_embedding
+
 
     def weighted_gaussian_parameters(self, logits):
         """
