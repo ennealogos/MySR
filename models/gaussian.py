@@ -122,11 +122,6 @@ def extract_patch(image, center, radius, padding_mode='constant'):
     return patch
 
 
-class GaussianInjectionBlock(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super(GaussianInjectionBlock, self).__init__()
-
-
 @register('gaussian-splatter')
 class GaussianSplatter(nn.Module):
     """A module that applies 2D Gaussian splatting to input features."""
